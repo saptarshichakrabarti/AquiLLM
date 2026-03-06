@@ -15,7 +15,8 @@ from django.apps import apps
 from asgiref.sync import sync_to_async
 
 from django.core import signing
-from json import loads
+from json import loads, dumps
+import re
 
 from tiktoken import encoding_for_model
 from google import genai as google_genai  # Google Gemini client library — aliased to avoid clash with the older google.generativeai import
@@ -378,15 +379,26 @@ class LLMInterface(ABC):
 
 
     async def spin(self, convo: Conversation, max_func_calls: int, send_func: Callable[[Conversation], Any], max_tokens: int) -> None:
+        """
+        Core agent loop: repeatedly call the LLM, execute any requested tools,
+        and only stop once the model returns a normal conversational reply or
+        the maximum number of tool calls has been reached.
+        """
         calls = 0
-        while calls < max_func_calls:
+        while True:
             convo, changed = await self.complete(convo, max_tokens)
             await send_func(convo)
+
+            # No change means the model did not request another tool call and
+            # has produced a final conversational answer for the user.
             if changed == 'unchanged':
                 return
-            last_message = convo[-1]    
+
+            last_message = convo[-1]
             if isinstance(last_message, AssistantMessage) and last_message.tool_call_id:
                 calls += 1
+                if calls >= max_func_calls:
+                    return
                 
 
 
@@ -495,13 +507,108 @@ class OpenAIInterface(LLMInterface):
         if DEBUG:
             print("OpenAI SDK Response:")
             pp(response)
-        tool_call = response.choices[0].message.tool_calls[0] if response.choices[0].message.tool_calls else None
-        text = response.choices[0].message.content
+        choice = response.choices[0].message
+        tool_call = choice.tool_calls[0] if choice.tool_calls else None
+        text = choice.content
+
+        # Special-case: message_to_user is a "pseudo-tool" that just forwards a message to the user.
+        # When the model calls it via proper tool_calls, unwrap its arguments into plain text instead
+        # of going through the normal tool execution pipeline.
         if tool_call and tool_call.function.name == 'message_to_user':
-            # this is a special tool that just sends a message to the user, so we don't need to return it.
-            # this is necessary because local models feel the need to call a tool every time. 
+            try:
+                args = loads(tool_call.function.arguments or "{}")
+                text = args.get('message', '')
+            except Exception:
+                # Fall back to leaving text as-is if parsing fails
+                pass
             tool_call = None
-            text = tool_call.function.arguments['message']
+
+        # Fallback for local models (e.g. Ollama) that don't support structured tool_calls but
+        # instead emit a markdown block like:
+        # ```tool_calls
+        # <tool_call>
+        # {"name": "document_ids", "parameters": {}}
+        # </tool_call>
+        # ```
+        if (not tool_call 
+            and isinstance(text, str) 
+            and "```tool_calls" in text 
+            and "<tool_call>" in text):
+            try:
+                m = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
+                if m:
+                    payload = loads(m.group(1))
+                    name = payload.get("name")
+                    params = payload.get("parameters", {})
+                    if name:
+                        class _SyntheticFunction:
+                            def __init__(self, name: str, arguments: str):
+                                self.name = name
+                                self.arguments = arguments
+                        class _SyntheticToolCall:
+                            def __init__(self, name: str, params: dict):
+                                self.id = f"local-{uuid.uuid4()}"
+                                self.function = _SyntheticFunction(name, dumps(params))
+                        tool_call = _SyntheticToolCall(name, params)
+                        # For tool calls we don't need the raw text content; the higher-level
+                        # pipeline will substitute a standard placeholder when text is falsy.
+                        text = None
+            except Exception:
+                # If anything goes wrong, just treat it as plain text.
+                pass
+
+        # Fallback 2: local models that emit a raw JSON tool call in the text,
+        # e.g. {"tool_calls": [{"name": "whole_document", "parameters": {"doc_id": "..."}}]}
+        if not tool_call and isinstance(text, str):
+            candidate = None
+
+            # First, try to parse the whole message as JSON.
+            try:
+                candidate = loads(text)
+            except Exception:
+                candidate = None
+
+            # If that failed, look for an inline JSON object containing "tool_calls".
+            if candidate is None and '"tool_calls"' in text:
+                try:
+                    m = re.search(r'(\{.*"tool_calls".*\})', text, re.DOTALL)
+                    if m:
+                        candidate = loads(m.group(1))
+                except Exception:
+                    candidate = None
+
+            call_spec = None
+            if isinstance(candidate, dict):
+                # OpenAI-style: {"tool_calls": [{...}]}
+                if "tool_calls" in candidate and isinstance(candidate["tool_calls"], list) and candidate["tool_calls"]:
+                    call_spec = candidate["tool_calls"][0]
+                else:
+                    # Simple form: {"name": "...", "parameters": {...}}
+                    call_spec = candidate
+
+            if isinstance(call_spec, dict):
+                name = call_spec.get("name")
+                params = (
+                    call_spec.get("parameters")
+                    or call_spec.get("arguments")
+                    or {}
+                )
+                if name and isinstance(params, dict):
+                    # Synthesize an OpenAI-style tool_call object so the rest of the
+                    # pipeline can treat this exactly like a native tool call.
+                    class _SyntheticFunction:
+                        def __init__(self, name: str, arguments: str):
+                            self.name = name
+                            self.arguments = arguments
+
+                    class _SyntheticToolCall:
+                        def __init__(self, name: str, params: dict):
+                            self.id = f"local-json-{uuid.uuid4()}"
+                            self.function = _SyntheticFunction(name, dumps(params))
+
+                    tool_call = _SyntheticToolCall(name, params)
+                    # Hide the raw JSON text from the user-facing message stream.
+                    text = None
 
         return LLMResponse(text=text,
                            tool_call={"tool_call_id": tool_call.id,

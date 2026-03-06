@@ -35,6 +35,7 @@ import concurrent.futures
 from django.db import DatabaseError
 from django.db.models import Case, When
 from django.utils import timezone
+from sentence_transformers import CrossEncoder
 from .utils import get_embedding
 from .settings import BASE_DIR
 
@@ -742,18 +743,40 @@ class TextChunk(models.Model):
             callback()
     @classmethod
     def rerank(cls, query:str, chunks, top_k: int):
-        cohere = apps.get_app_config('aquillm').cohere_client # type: ignore
-        response = cohere.rerank(
-            model="rerank-english-v3.0",
-            query=query,
-            documents=list([{"content": chunk.content, "id": chunk.pk} for chunk in chunks]),
-            rank_fields=['content'],
-            top_n=top_k,
-            return_documents=True 
-        )
-        ranked_list = list([result.document.id for result in response.results])
-        preserved = Case(*[When(pk=pk, then=pos) for pos, pk in enumerate(ranked_list)])
-        return cls.objects.filter(pk__in=ranked_list).order_by(preserved)
+        """
+        Rerank candidate chunks using a local CrossEncoder model.
+
+        Uses BAAI/bge-reranker-base to score (query, chunk.content) pairs and
+        returns a queryset of the top_k chunks ordered by descending score.
+        """
+        # Lazily initialize the global CrossEncoder to avoid issues during import
+        global _cross_encoder
+        try:
+            _cross_encoder
+        except NameError:
+            _cross_encoder = CrossEncoder("BAAI/bge-reranker-base")
+
+        # Materialize and deduplicate chunks while preserving initial order
+        materialized = []
+        seen_ids = set()
+        for chunk in chunks:
+            if chunk.pk not in seen_ids:
+                seen_ids.add(chunk.pk)
+                materialized.append(chunk)
+
+        if not materialized:
+            return cls.objects.none()
+
+        pairs = [(query, chunk.content) for chunk in materialized]
+        scores = _cross_encoder.predict(pairs)
+
+        # Sort chunks by score (descending) and keep top_k
+        scored = sorted(zip(materialized, scores), key=lambda x: x[1], reverse=True)
+        top_chunks = [chunk for chunk, _ in scored[:top_k]]
+
+        ranked_ids = [chunk.pk for chunk in top_chunks]
+        preserved = Case(*[When(pk=pk, then=pos) for pos, pk in enumerate(ranked_ids)])
+        return cls.objects.filter(pk__in=ranked_ids).order_by(preserved)
 
 
     @classmethod

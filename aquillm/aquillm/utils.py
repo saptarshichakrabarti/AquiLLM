@@ -1,22 +1,25 @@
 
 import logging
+from sentence_transformers import SentenceTransformer
+
 logger = logging.getLogger(__name__)
 
 
+# Global SentenceTransformer model for embeddings
+_embedding_model = SentenceTransformer("BAAI/bge-large-en-v1.5")
 
 
-from django.apps import apps
+def get_embedding(query: str, input_type: str = 'search_query'):
+    """
+    Return an embedding vector for the given text using a local
+    SentenceTransformer model (BAAI/bge-large-en-v1.5).
 
+    The input_type parameter is kept for backward compatibility with the
+    previous Cohere-based implementation but is not used by this model.
+    """
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("query must be a non-empty string")
 
-def get_embedding(query: str, input_type: str='search_query'):
-    cohere_client = apps.get_app_config('aquillm').cohere_client
-    if cohere_client is None:
-        raise Exception("Cohere client is still none while app is running")
-    if input_type not in ('search_document', 'search_query', 'classification', 'clustering'):
-        raise ValueError(f'bad input type to embedding call: {input_type}')
-    response = cohere_client.embed(
-        texts=[query],
-        model="embed-english-v3.0",
-        input_type=input_type
-    )
-    return response.embeddings[0]
+    embedding = _embedding_model.encode(query)
+    # pgvector expects a plain list of floats, not a NumPy array
+    return embedding.tolist()

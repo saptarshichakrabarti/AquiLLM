@@ -29,7 +29,7 @@ More info can be found at [[https://aquillm.org]]
 *   **Frontend**: React
 *   **Database**: PostgreSQL
 *   **Vector Store**: pgvector (PostgreSQL extension)
-*   **LLM Integration**: Claude, OpenAI, Gemini as desired
+*   **LLM Integration**: Claude, OpenAI, Gemini, or local LLMs (via Ollama)
 *   **Asynchronous Tasks**: Celery, Redis, Django Channels
 
 *   **Authentication**: django-allauth
@@ -49,9 +49,21 @@ This assumes you have Docker and Docker Compose installed.
     cp .env.example .env
     ```
 3.  **Edit the .env file with your specific configuration:**
-    - Database settings: POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_NAME, POSTGRES_HOST
-    - At least one LLM API key (ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY)
-    - Set LLM_CHOICE to your preferred provider (`CLAUDE`, `OPENAI`, or `GEMINI`). To switch models after initial setup, update LLM_CHOICE in `.env` and do a full restart: `docker compose down && docker compose up` — a simple restart may not pick up the change.
+    - **Database settings**: `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_NAME`, `POSTGRES_HOST`
+    - **LLM backend** (set **exactly one** of the following, see also “Configuring the LLM backend” below):
+      - Hosted APIs:
+        - `LLM_CHOICE=CLAUDE` &rarr; requires `ANTHROPIC_API_KEY`
+        - `LLM_CHOICE=OPENAI` &rarr; requires `OPENAI_API_KEY`
+        - `LLM_CHOICE=GEMINI` &rarr; requires `GEMINI_API_KEY`
+      - Local / OSS via Ollama (no external API key required):
+        - `LLM_CHOICE=GEMMA3` (uses `ebdm/gemma3-enhanced:12b` through Ollama)
+        - `LLM_CHOICE=LLAMA3.2`
+        - `LLM_CHOICE=GPT-OSS:120b` (via the `gpt-oss:120b` Ollama model)
+      - To switch models after initial setup, update `LLM_CHOICE` in `.env` and do a full restart:
+        ```bash
+        docker compose down && docker compose up
+        ```
+        A simple restart may not pick up the change.
 
 4.  **Build and run using Docker Compose:**
     ```bash
@@ -100,9 +112,20 @@ docker compose -f docker-compose-prod.yml down && docker compose -f docker-compo
     cp .env.example .env
     ```
 3.  **Edit the .env file with your specific configuration:**
-    - Database settings: POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_NAME, POSTGRES_HOST
-    - At least one LLM API key (ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY)
-    - Set LLM_CHOICE to your preferred provider (`CLAUDE`, `OPENAI`, or `GEMINI`). To switch models after initial setup, update LLM_CHOICE in `.env` and do a full restart: `docker compose down && docker compose -f docker-compose-prod.yml up` — a simple restart may not pick up the change.
+    - **Database settings**: `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_NAME`, `POSTGRES_HOST`
+    - **LLM backend**:
+      - Hosted APIs:
+        - `LLM_CHOICE=CLAUDE` &rarr; requires `ANTHROPIC_API_KEY`
+        - `LLM_CHOICE=OPENAI` &rarr; requires `OPENAI_API_KEY`
+        - `LLM_CHOICE=GEMINI` &rarr; requires `GEMINI_API_KEY`
+      - Local / OSS via Ollama:
+        - `LLM_CHOICE=GEMMA3`
+        - `LLM_CHOICE=LLAMA3.2`
+        - `LLM_CHOICE=GPT-OSS`
+      - To switch models after initial setup, update `LLM_CHOICE` in `.env` and do a full restart:
+        ```bash
+        docker compose down && docker compose -f docker-compose-prod.yml up --build -d
+        ```
     - Optional: Google OAuth credentials (GOOGLE_OAUTH2_CLIENT_ID, GOOGLE_OAUTH2_CLIENT_SECRET)
     - Optional: Email access permissions (ALLOWED_EMAIL_DOMAINS, ALLOWED_EMAIL_ADDRESSES). Required if OAuth is to be used.
     - Set HOST_NAME for your domain or use 'localhost' for development
@@ -117,6 +140,39 @@ docker compose -f docker-compose-prod.yml down && docker compose -f docker-compo
    ```bash
    docker compose -f docker-compose-prod.yml exec web ./manage.py addsuperuser
    ```
+
+
+## Configuring the LLM backend
+
+- **Claude (Anthropic)**:
+  - Set `LLM_CHOICE=CLAUDE` and define `ANTHROPIC_API_KEY` in `.env`.
+- **OpenAI (hosted)**:
+  - Set `LLM_CHOICE=OPENAI` and define `OPENAI_API_KEY`.
+- **Gemini (Google)**:
+  - Set `LLM_CHOICE=GEMINI` and define `GEMINI_API_KEY`.
+- **Local / offline LLMs via Ollama**:
+  - Install and run Ollama on the host.
+  - Ensure the Docker Compose setup includes an `ollama` service (provided in this repo) reachable at `http://ollama:11434` from the web container.
+  - Pull the desired models in Ollama, for example:
+    ```bash
+    ollama pull ebdm/gemma3-enhanced:12b
+    ollama pull llama3.2
+    ollama pull gpt-oss:120b
+    ```
+  - Set one of:
+    - `LLM_CHOICE=GEMMA3`
+    - `LLM_CHOICE=LLAMA3.2`
+    - `LLM_CHOICE=GPT-OSS`
+  - No external API keys are needed for these choices; the backend talks to Ollama via its OpenAI-compatible HTTP API.
+
+### Embeddings and reranking
+
+- **Document embeddings**:
+  - AquiLLM now uses a local [SentenceTransformers](https://www.sbert.net/) model (`BAAI/bge-large-en-v1.5`) defined in `aquillm/utils.py`.
+  - The model will be downloaded automatically on first use; ensure the machine has enough disk space and RAM.
+- **Reranking**:
+  - Candidate chunks from pgvector and trigram search are reranked using a local CrossEncoder (`BAAI/bge-reranker-base`) in `TextChunk.rerank`.
+  - No Cohere rerank API calls are required anymore; everything runs locally.
 
 
 ## Using AquiLLM
@@ -167,3 +223,13 @@ We welcome contributions! AquiLLM is an open-source project, and we appreciate h
 *   **Reporting Bugs**: Please open an issue on GitHub detailing the problem, expected behavior, and steps to reproduce.
 *   **Feature Requests**: Open an issue describing the feature and its potential benefits.
 *   **Pull Requests**: Send a pull request!
+
+
+## Changelog
+
+### 2026-03-06 – Local LLMs, local embeddings, agentic tools
+
+- **Local embeddings**: Switched RAG embeddings from Cohere to a local SentenceTransformers model (`BAAI/bge-large-en-v1.5`) and added a local CrossEncoder reranker (`BAAI/bge-reranker-base`) for higher-quality ranking without external API calls.
+- **LLM backends**: Extended `LLM_CHOICE` to support Ollama-backed models (`GEMMA3`, `LLAMA3.2`, `GPT-OSS`) alongside existing Claude, OpenAI, and Gemini backends.
+- **Agentic tool loop**: Updated the chat backend to run an internal agent loop that automatically executes tools (vector search, whole_document, astrophotography helpers, etc.) and only returns final conversational text to the user.
+- **Tool-call robustness**: Hardened tool-call parsing so local models that emit raw JSON or markdown-wrapped tool calls are correctly interpreted and executed, instead of leaking raw JSON into the chat UI.

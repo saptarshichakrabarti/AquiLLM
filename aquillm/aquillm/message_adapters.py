@@ -146,12 +146,20 @@ def build_frontend_conversation_json(db_convo: WSConversation) -> dict:
     Returns a dict matching the structure the frontend already expects,
     so no frontend changes were needed for this redesign.
     """
+    MAGIC_EMPTY_TOOL_TEXT = "** Empty Message, tool call **"
+
     messages = []
     for msg in db_convo.db_messages.order_by('sequence_number'):
         # Fields included for every message type
+        content = msg.content or ""
+        if msg.role == 'assistant' and MAGIC_EMPTY_TOOL_TEXT in content:
+            # Strip the internal placeholder so the user never sees it.
+            content = content.replace("\n\n" + MAGIC_EMPTY_TOOL_TEXT, "")
+            content = content.replace(MAGIC_EMPTY_TOOL_TEXT, "")
+
         msg_dict = {
             'role': msg.role,
-            'content': msg.content,
+            'content': content,
             'message_uuid': str(msg.message_uuid),  # convert UUID to string for JSON
             'rating': msg.rating,
         }

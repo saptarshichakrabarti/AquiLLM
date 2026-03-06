@@ -1,6 +1,7 @@
 django
 psycopg2-binary
 cohere
+sentence-transformers
 python-dotenv
 pgvector
 pypdf
